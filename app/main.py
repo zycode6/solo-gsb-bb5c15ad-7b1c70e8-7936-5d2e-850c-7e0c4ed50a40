@@ -7,6 +7,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .chain import GENESIS_HASH, record_hash
 from .db import get_conn, init_db
 
 app = FastAPI(title="Webhook Event Receiver & Replay")
@@ -61,21 +62,45 @@ def health() -> dict[str, str]:
 
 @app.post("/events", status_code=201)
 def create_event(event: EventIn):
-    """接收单个事件, 按 event_id 幂等: 重复投递不产生重复记录。"""
+    """接收单个事件, 按 event_id 幂等: 重复投递不产生重复记录, 也不改变哈希链。"""
+    received_at = utc_now()
+    occurred_at = normalize_dt(event.occurred_at)
     try:
         with get_conn() as conn:
-            conn.execute(
+            # BEGIN IMMEDIATE 提前获取写锁, 保证"读链头 -> 写入"在同一事务内原子完成
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = row["hash"] if row else GENESIS_HASH
+            cur = conn.execute(
                 "INSERT INTO events (event_id, occurred_at, payload, received_at)"
                 " VALUES (?, ?, ?, ?)",
                 (
                     event.event_id,
-                    normalize_dt(event.occurred_at),
+                    occurred_at,
                     json.dumps(event.payload, ensure_ascii=False),
-                    utc_now(),
+                    received_at,
+                ),
+            )
+            seq = cur.lastrowid
+            conn.execute(
+                "UPDATE events SET prev_hash = ?, hash = ? WHERE id = ?",
+                (
+                    prev_hash,
+                    record_hash(
+                        seq=seq,
+                        event_id=event.event_id,
+                        occurred_at=occurred_at,
+                        payload=event.payload,
+                        received_at=received_at,
+                        prev_hash=prev_hash,
+                    ),
+                    seq,
                 ),
             )
     except sqlite3.IntegrityError:
-        # event_id 已存在 -> 幂等返回, 不写入重复记录
+        # event_id 已存在 -> 幂等返回, 不写入重复记录, 链保持不变
         return JSONResponse(
             status_code=200,
             content={"status": "duplicate", "event_id": event.event_id},
@@ -148,3 +173,48 @@ def replay(req: ReplayIn):
         "skipped": len(results) - replayed,
         "results": results,
     }
+
+
+def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str, Any]:
+    return {
+        "verified": False,
+        "checked": checked,
+        "first_break": {"seq": seq, "event_id": event_id, "reason": reason},
+    }
+
+
+@app.get("/integrity")
+def integrity():
+    """从最早记录开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM events ORDER BY id"
+        ).fetchall()
+
+    checked = 0
+    prev_seq: Optional[int] = None
+    prev_hash = GENESIS_HASH
+    for row in rows:
+        seq = row["id"]
+        # 序号连续性: 相邻记录 seq 必须逐一递增
+        if prev_seq is not None and seq != prev_seq + 1:
+            return _chain_break(checked, seq, row["event_id"], "seq_gap")
+        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为创世空串)
+        if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
+            return _chain_break(checked, seq, row["event_id"], "prev_hash_mismatch")
+        # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
+        if row["hash"] is None or row["hash"] != record_hash(
+            seq=seq,
+            event_id=row["event_id"],
+            occurred_at=row["occurred_at"],
+            payload=json.loads(row["payload"]),
+            received_at=row["received_at"],
+            prev_hash=row["prev_hash"],
+        ):
+            return _chain_break(checked, seq, row["event_id"], "hash_mismatch")
+        checked += 1
+        prev_seq = seq
+        prev_hash = row["hash"]
+
+    return {"verified": True, "checked": checked, "first_break": None}
